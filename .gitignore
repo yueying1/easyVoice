@@ -5,8 +5,16 @@
 **/dist/**
 .env
 **/audio
+/Str/
+/books/
 **analysis**
 run.test.sh
 run.prod.sh
 **test**.sh
 scripts/docker-compose.yml
+.env
+.pnpm-store/
+.bin/
+ffmpeg/
+test.html.bak
+/.npmrc

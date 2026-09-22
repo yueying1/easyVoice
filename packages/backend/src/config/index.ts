@@ -1,5 +1,5 @@
 import dotenv from 'dotenv'
-import { resolve, join } from 'path'
+import { resolve, join, relative, isAbsolute } from 'path'
 
 dotenv.config({
   path: [
@@ -11,10 +11,27 @@ export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
 }
 
-export const AUDIO_DIR = join(__dirname, '..', '..', 'audio')
+// 项目根目录：本文件位于 packages/backend/dist/config（编译后）或 packages/backend/src/config（tsx 开发），向上四级即项目根
+export const ROOT_DIR = join(__dirname, '..', '..', '..', '..')
+
+// 音频(mp3)输出到项目根 audio 目录，字幕(srt)输出到项目根 Str 目录
+export const AUDIO_DIR = join(ROOT_DIR, 'audio')
+export const SRT_DIR = join(ROOT_DIR, 'Str')
+// 上传的小说原文（按章节批量合成时使用，保留原文便于中断后继续）
+export const BOOKS_DIR = join(ROOT_DIR, 'books')
 export const AUDIO_CACHE_DIR = join(AUDIO_DIR, '.cache')
 export const PUBLIC_DIR = join(__dirname, '..', '..', 'public')
 export const ALLOWED_EXTENSIONS = new Set(['.mp3', '.wav', '.ogg', '.flac', '.srt'])
+
+/**
+ * 字幕路径映射：把音频目录内的 .mp3 路径映射为字幕目录内同名的 .srt 路径。
+ * 不在音频目录内的路径退化为同级替换，避免出现 `..` 相对路径
+ */
+export function srtPathFor(audioPath: string): string {
+  const rel = relative(AUDIO_DIR, audioPath)
+  const target = rel && !rel.startsWith('..') && !isAbsolute(rel) ? join(SRT_DIR, rel) : audioPath
+  return target.replace(/\.mp3$/i, '.srt')
+}
 
 export const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY

@@ -3,7 +3,7 @@ import { generateTTS } from '../services/tts.service'
 import { logger } from '../utils/logger'
 import path from 'path'
 import fs from 'fs/promises'
-import { ALLOWED_EXTENSIONS, AUDIO_DIR } from '../config'
+import { ALLOWED_EXTENSIONS, AUDIO_DIR, SRT_DIR } from '../config'
 import { EdgeSchema } from '../schema/generate'
 import taskManager from '../utils/taskManager'
 function formatBody({ text, pitch, voice, volume, rate, useLLM }: EdgeSchema) {
@@ -114,7 +114,9 @@ export async function generateAudio(req: Request, res: Response, next: NextFunct
 }
 
 export async function downloadAudio(req: Request, res: Response): Promise<void> {
-  const fileName = req.params.file
+  // 路由用 /download/* 通配：整本小说按章节合成时，产物在 `audio/<书名>/xxx.mp3`、
+  // `Str/<书名>/xxx.srt`，所以这里要接受带一层目录的相对路径
+  const fileName = (req.params as Record<string, string>)[0] || req.params.file
 
   try {
     if (!fileName || typeof fileName !== 'string') {
@@ -126,20 +128,25 @@ export async function downloadAudio(req: Request, res: Response): Promise<void> 
       throw new Error('Invalid file type')
     }
 
-    const safeFileName = path.basename(fileName)
-    const encodedFileName = encodeURIComponent(safeFileName)
-    const filePath = path.join(AUDIO_DIR, safeFileName)
+    const displayName = path.basename(fileName)
+    const encodedFileName = encodeURIComponent(displayName)
+    // 字幕(Str)与音频(audio)分开存放，按扩展名选择所在目录
+    const baseDir = fileExt === '.srt' ? SRT_DIR : AUDIO_DIR
+    const filePath = resolveInside(baseDir, fileName)
 
     await fs.access(filePath, fs.constants.R_OK)
 
-    res.setHeader('Content-Type', `audio/${fileExt.slice(1)}`)
+    res.setHeader(
+      'Content-Type',
+      fileExt === '.srt' ? 'application/x-subrip; charset=utf-8' : `audio/${fileExt.slice(1)}`
+    )
     res.setHeader('Content-Disposition', `attachment; filename="${encodedFileName}"`)
 
-    res.download(filePath, safeFileName, (err) => {
+    res.download(filePath, displayName, (err) => {
       if (err) {
         throw err
       }
-      logger.info(`Successfully downloaded file: ${safeFileName}`)
+      logger.info(`Successfully downloaded file: ${fileName}`)
     })
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error)
@@ -156,6 +163,22 @@ export async function downloadAudio(req: Request, res: Response): Promise<void> 
       message: errorMessage,
     })
   }
+}
+
+/**
+ * 把用户传入的相对路径安全解析到 baseDir 内：允许一层（或多层）子目录，
+ * 但拒绝任何形式的目录穿越，避免读到项目里的其他文件
+ */
+function resolveInside(baseDir: string, relPath: string): string {
+  const normalized = path.normalize(relPath).replace(/^([/\\]|\.\.[/\\])+/, '')
+  if (!normalized || normalized.includes('..')) {
+    throw new Error('Invalid file path')
+  }
+  const full = path.resolve(baseDir, normalized)
+  if (full !== baseDir && !full.startsWith(baseDir + path.sep)) {
+    throw new Error('Invalid file path')
+  }
+  return full
 }
 
 export async function getVoiceList(req: Request, res: Response, next: NextFunction) {

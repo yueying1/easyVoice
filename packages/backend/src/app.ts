@@ -13,12 +13,13 @@ interface AppConfig {
   rateLimit: number
   rateLimitWindow: number
   audioDir: string
+  srtDir: string
   publicDir: string
 }
 
 // 创建应用工厂函数
 export function createApp(config: AppConfig): Application {
-  const { isDev, rateLimit, rateLimitWindow, audioDir, publicDir } = config
+  const { isDev, rateLimit, rateLimitWindow, audioDir, srtDir, publicDir } = config
   logger.debug('Initializing application...')
 
   const app = express()
@@ -37,7 +38,7 @@ export function createApp(config: AppConfig): Application {
   setupRoutes(app)
 
   // 配置静态文件服务
-  configureStaticFiles(app, { audioDir, publicDir })
+  configureStaticFiles(app, { audioDir, srtDir, publicDir })
 
   registerEngines()
   app.use(errorHandler)

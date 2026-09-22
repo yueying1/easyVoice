@@ -1,7 +1,7 @@
 import path from 'path'
 import fs from 'fs/promises'
 import ffmpeg from 'fluent-ffmpeg'
-import { AUDIO_DIR, STATIC_DOMAIN, EDGE_API_LIMIT } from '../config'
+import { AUDIO_DIR, STATIC_DOMAIN, EDGE_API_LIMIT, srtPathFor } from '../config'
 import { logger } from '../utils/logger'
 import { getPrompt } from '../llm/prompt/generateSegment'
 import { ensureDir, generateId, getLangConfig, readJson } from '../utils'
@@ -25,6 +25,9 @@ export enum ErrorMessages {
   TTS_GENERATION_FAILED = 'TTS generation failed',
   INCOMPLETE_RESULT = 'Incomplete TTS result',
 }
+
+/** ffmpeg 拼接单章音频的超时上限，超时即视为失败，避免批量任务卡死在一个章节上 */
+const CONCAT_TIMEOUT_MS = Number(process.env.CONCAT_TIMEOUT_MS || 180_000)
 
 /**
  * 生成文本转语音 (TTS) 的音频和字幕
@@ -147,7 +150,7 @@ const buildFinal = async (finalSegments: TTSResult[], id: string) => {
   await ensureDir(finalDir)
   const finalJson = path.resolve(finalDir, '[merged]all_splits.mp3.json')
   await fs.writeFile(finalJson, JSON.stringify(mergedJson, null, 2))
-  await generateSrt(finalJson, path.resolve(AUDIO_DIR, id.replace('.mp3', '.srt')))
+  await generateSrt(finalJson, srtPathFor(path.resolve(AUDIO_DIR, id)))
   const fileList = finalSegments.map((segment) =>
     path.resolve(AUDIO_DIR, path.parse(segment.audio).base)
   )
@@ -164,7 +167,8 @@ const buildFinal = async (finalSegments: TTSResult[], id: string) => {
 async function generateWithoutLLM(
   segment: Segment,
   params: TTSParams,
-  task?: Task
+  task?: Task,
+  options: GenerateOptions = {}
 ): Promise<TTSResult> {
   const { text, pitch, voice, rate, volume } = params
   const { length, segments } = splitText(text)
@@ -173,10 +177,54 @@ async function generateWithoutLLM(
     return buildSegment(segment, params)
   } else {
     const buildSegments = segments.map((segment) => ({ ...params, text: segment }))
-    let result = await buildSegmentList(segment, buildSegments, task)
+    let result = await buildSegmentList(segment, buildSegments, task, options)
     task?.updateProgress?.(task.id, 100)
     return result
   }
+}
+
+export interface GenerateOptions {
+  /** 是否使用分段音频缓存（章节批量合成时建议关闭，避免命中已清理的旧分段路径） */
+  useCache?: boolean
+  /** 合成完成后是否删除分段临时目录（章节批量合成时开启，避免上万个中间文件堆积） */
+  cleanupTmp?: boolean
+  /** 严格模式：任一分段失败就整章判失败，避免静默产出缺内容的音频 */
+  strictSegments?: boolean
+  /** 章内分段并发数（默认 EDGE_API_LIMIT；批量长跑时调低更稳，减少被限流断连） */
+  segmentConcurrency?: number
+  /** 分段进度回调（批量合成时用于显示「第 n/N 段」） */
+  onSegmentProgress?: (percent: number, handled: number, total: number) => void
+}
+
+/**
+ * 用指定的输出文件名生成音频与字幕（章节批量合成用，绕开按文本自动命名的逻辑）
+ * @param params.outputId 输出文件名，如 `0002_第一卷_第一节：纵身亡魔心仍不悔.mp3`
+ */
+export async function generateTTSWithId(
+  params: Omit<Required<EdgeSchema>, 'useLLM'> & { outputId: string } & GenerateOptions
+): Promise<TTSResult> {
+  const {
+    text,
+    pitch,
+    voice,
+    rate,
+    volume,
+    outputId,
+    useCache = false,
+    cleanupTmp = false,
+    strictSegments = false,
+    segmentConcurrency,
+    onSegmentProgress,
+  } = params
+  const segment: Segment = { id: outputId, text }
+  const result = await generateWithoutLLM(
+    segment,
+    { text, pitch, voice, rate, volume, output: outputId },
+    undefined,
+    { useCache, cleanupTmp, strictSegments, segmentConcurrency, onSegmentProgress }
+  )
+  validateTTSResult(result, outputId)
+  return result
 }
 
 /**
@@ -214,8 +262,16 @@ async function buildSegment(
 async function buildSegmentList(
   segment: Segment,
   segments: BuildSegment[],
-  task?: Task
+  task?: Task,
+  options: GenerateOptions = {}
 ): Promise<TTSResult> {
+  const {
+    useCache = true,
+    cleanupTmp = false,
+    strictSegments = false,
+    segmentConcurrency,
+    onSegmentProgress,
+  } = options
   const fileList: string[] = []
   const length = segments.length
   let handledLength = 0
@@ -238,34 +294,58 @@ async function buildSegmentList(
     const { text, pitch, voice, rate, volume } = segment
     const output = path.resolve(tmpDirPath, `${index + 1}_splits.mp3`)
     const cacheKey = taskManager.generateTaskId({ text, pitch, voice, rate, volume })
-    const cache = await audioCacheInstance.getAudio(cacheKey)
-    if (cache) {
-      logger.info(`Cache hit[segments]: ${voice} ${text.slice(0, 10)}`)
-      fileList.push(cache.audio)
-      return cache
+    if (useCache) {
+      const cache = await audioCacheInstance.getAudio(cacheKey)
+      if (cache) {
+        logger.info(`Cache hit[segments]: ${voice} ${text.slice(0, 10)}`)
+        fileList.push(cache.audio)
+        return cache
+      }
     }
     const result = await generateSingleVoice({ text, pitch, voice, rate, volume, output })
     logger.debug(`Cache miss and generate audio: ${result.audio}, ${result.srt}`)
     fileList.push(result.audio)
     handledLength++
     task?.updateProgress?.(task.id, getProgress())
-    const params = { text, pitch, voice, rate, volume }
-    await audioCacheInstance.setAudio(cacheKey, { ...params, ...result })
+    onSegmentProgress?.(getProgress(), handledLength, length)
+    if (useCache) {
+      const params = { text, pitch, voice, rate, volume }
+      await audioCacheInstance.setAudio(cacheKey, { ...params, ...result })
+    }
     return result
   })
   let partial = false
-  const results = await runConcurrentTasks(tasks, EDGE_API_LIMIT)
-  if (results?.some((result) => !result.success)) {
+  const results = await runConcurrentTasks(tasks, segmentConcurrency || EDGE_API_LIMIT)
+  const failed = (results || []).filter((result) => !result?.success)
+  if (failed.length) {
     logger.warn(`Partial result detected, some splits generated audio failed!`, results)
     partial = true
   }
   const outputFile = path.resolve(AUDIO_DIR, id)
+  // 严格模式（章节批量合成）：有分段失败就整章失败，让这一章下次重跑，
+  // 避免拼出缺内容的音频却被当成"已完成"而永远跳过
+  if (strictSegments && failed.length) {
+    const reasons = failed
+      .map((r) => (r?.error instanceof Error ? r.error.message : r?.error))
+      .filter(Boolean)
+      .slice(0, 3)
+      .join('; ')
+    if (cleanupTmp) {
+      await fs.rm(tmpDirPath, { recursive: true, force: true }).catch(() => undefined)
+    }
+    throw new Error(`${failed.length}/${length} 个分段合成失败：${reasons || '未知原因'}`)
+  }
   logger.debug(`Concatenating audio files from ${tmpDirPath} to ${outputFile}`)
   await concatDirAudio({ inputDir: tmpDirPath, fileList, outputFile })
   await concatDirSrt({ inputDir: tmpDirPath, fileList, outputFile })
   logger.debug(
     `Concatenating SRT files from ${tmpDirPath} to ${outputFile.replace('.mp3', '.srt')}`
   )
+  if (cleanupTmp) {
+    await fs.rm(tmpDirPath, { recursive: true, force: true }).catch((err) => {
+      logger.warn(`Failed to clean tmp dir ${tmpDirPath}: ${(err as Error).message}`)
+    })
+  }
 
   return {
     audio: `${STATIC_DOMAIN}/${id}`,
@@ -355,14 +435,28 @@ export async function concatDirAudio({
   await fs.writeFile(tempListPath, mp3Files.map((file) => `file '${file}'`).join('\n'))
 
   await new Promise<void>((resolve, reject) => {
+    let settled = false
+    // ffmpeg 若无法启动（或异常挂起），fluent-ffmpeg 不一定触发 error 事件，
+    // promise 会永远不落地；这里加超时兜底，保证批量任务不会卡死在某一章
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error(`Concat audio timeout after ${CONCAT_TIMEOUT_MS}ms: ${outputFile}`))
+    }, CONCAT_TIMEOUT_MS)
+    const finish = (err?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      err ? reject(err) : resolve()
+    }
     ffmpeg()
       .input(tempListPath)
       .inputFormat('concat')
       .inputOption('-safe', '0')
       .audioCodec('copy')
       .output(outputFile)
-      .on('end', () => resolve())
-      .on('error', (err) => reject(new Error(`Concat failed: ${err.message}`)))
+      .on('end', () => finish())
+      .on('error', (err) => finish(new Error(`Concat failed: ${err.message}`)))
       .run()
   })
 }
@@ -387,7 +481,7 @@ export async function concatDirSrt({
   const mergedJson = mergeSubtitleFiles(subtitleFiles)
   const tempJsonPath = path.resolve(inputDir, 'all_splits.mp3.json')
   await fs.writeFile(tempJsonPath, JSON.stringify(mergedJson, null, 2))
-  await generateSrt(tempJsonPath, outputFile.replace('.mp3', '.srt'))
+  await generateSrt(tempJsonPath, srtPathFor(outputFile))
 }
 
 /**

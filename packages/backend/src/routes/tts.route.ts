@@ -26,6 +26,8 @@ router.get('/engines', (req, res) => {
 router.get('/voiceList', getVoiceList)
 router.get('/task/stats', getTaskStats)
 router.get('/task/:id', getTask)
+// 用通配符接收相对路径，支持 `书名/xxx.mp3` 这种带文件夹的产物
+router.get('/download/*', downloadAudio)
 router.get('/download/:file', downloadAudio)
 
 router.post('/create', pickSchema, createTask)

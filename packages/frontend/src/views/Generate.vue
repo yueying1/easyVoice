@@ -36,6 +36,11 @@
                 <div class="el-upload__tip">支持 .txt 文本文件</div>
               </template>
             </el-upload>
+            <div class="chapter-entry">
+              整本小说（几十万字、上千章）？
+              <el-button link type="primary" @click="goChapterPage">按章节批量合成</el-button>
+              —— 自动分章，一章一个 mp3，中断后可继续
+            </div>
           </div>
         </el-card>
       </el-col>
@@ -247,6 +252,8 @@ import {
   toFixed,
 } from '@/utils'
 import confetti from 'canvas-confetti'
+import { useRouter } from 'vue-router'
+import { setPendingBook } from '@/utils/pendingBook'
 import { useAudioConfigStore, type AudioConfig } from '@/stores/audioConfig'
 import { defaultVoiceList, previewTextSelect } from '@/constants/voice'
 import DownloadList from '@/components/DownloadList.vue'
@@ -263,6 +270,10 @@ import {
 const generationStore = useGenerationStore()
 const configStore = useAudioConfigStore()
 const { audioConfig } = configStore
+const router = useRouter()
+
+/** 跳转到整本小说按章节批量合成页面 */
+const goChapterPage = () => router.push('/chapter')
 
 const streamDuration = ref<number>(0)
 
@@ -458,10 +469,19 @@ const playSuccessSound = () => {
 
 const handleFile = (file: any) => {
   const reader = new FileReader()
-  const { name, type } = file.raw
+  const { name, type, size } = file.raw
   if (type !== 'text/plain') {
     ElMessage.error('请上传 txt 文本！')
     console.log(name, type)
+    return
+  }
+  // 整本小说（约几十万字以上）不要塞进这里的输入框：
+  // 一是几十兆文本会把页面和浏览器存储撑爆，二是这里只会产出一个 mp3。
+  // 直接转交「按章节批量合成」页面，自动上传解析
+  if (size > 1024 * 1024) {
+    setPendingBook(file.raw)
+    ElMessage.warning('检测到整本小说，已切换到「按章节批量合成」（每章一个 mp3）')
+    router.push('/chapter')
     return
   }
   reader.onload = (e) => {
@@ -611,6 +631,8 @@ const generateAudioTask = async () => {
     }
     console.log('typeof stream:', typeof stream)
     console.log('stream instanceof ReadableStream :', stream instanceof ReadableStream)
+    // 后端生成的字幕文件名（长文本走流式时也需要能下载字幕）
+    const streamSrtName = (stream as any)?.srtName as string | undefined
     showStreamButton.value = true
     const onStart = () => {
       console.log('call onStart...')
@@ -638,6 +660,7 @@ const generateAudioTask = async () => {
         id: name,
         name,
         blobs,
+        ...(streamSrtName ? { srt: streamSrtName } : {}),
       }
       generationStore.updateProgress(100)
       updateAudioList(result)
@@ -765,6 +788,13 @@ onMounted(async () => {
   margin-top: 1.5rem;
   border-top: 1px dashed #e2e8f0;
   padding-top: 1.5rem;
+}
+
+.chapter-entry {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  color: #64748b;
+  text-align: center;
 }
 
 .voice-mode-selector {

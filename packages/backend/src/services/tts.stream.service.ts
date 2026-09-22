@@ -2,7 +2,7 @@ import path, { resolve } from 'path'
 import { Response } from 'express'
 import fs, { readdir } from 'fs/promises'
 import ffmpeg from 'fluent-ffmpeg'
-import { AUDIO_DIR, STATIC_DOMAIN, EDGE_API_LIMIT } from '../config'
+import { AUDIO_DIR, STATIC_DOMAIN, EDGE_API_LIMIT, srtPathFor } from '../config'
 import { logger } from '../utils/logger'
 import { getPrompt } from '../llm/prompt/generateSegment'
 import {
@@ -33,6 +33,58 @@ enum ErrorMessages {
   INVALID_PARAMS_FORMAT = 'Invalid TTS parameters format',
   TTS_GENERATION_FAILED = 'TTS generation failed',
   INCOMPLETE_RESULT = 'Incomplete TTS result',
+}
+
+/**
+ * 流式响应头：除标记流类型外，把本次生成的字幕文件名一起告诉前端，
+ * 前端在流式（长文本）流程里才能拿到可下载的 srt 名称。
+ * 文件名含中文，HTTP 头只能是 latin-1，因此做 URL 编码，前端解码后使用
+ */
+function streamingHeaders(task: Task, audioId: string) {
+  const srtName = audioId.replace(/\.mp3$/i, '.srt')
+  return {
+    'content-type': 'application/octet-stream',
+    'x-generate-tts-type': 'stream',
+    'x-generate-tts-srt': encodeURIComponent(srtName),
+    'Access-Control-Expose-Headers': 'x-generate-tts-type, x-generate-tts-srt',
+    'Access-Control-Expose-Headers-generate-tts-id': task.id,
+  }
+}
+
+/**
+ * 生成单个分段音频并写入输出流，等待其结束。
+ * WebSocket 中途断连（如 1006）等错误在此捕获并重试；
+ * 重试耗尽则放弃该分段并继续后续分段，保证整体生成不中断、进程不崩溃
+ */
+async function pipeSegmentWithRetry(
+  createStream: () => Promise<Readable>,
+  outputStream: PassThrough,
+  label: string,
+  maxAttempts = 3
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const audioStream = await createStream()
+      await new Promise<void>((resolve, reject) => {
+        audioStream.on('error', reject)
+        audioStream.on('end', resolve)
+        audioStream.pipe(outputStream, { end: false })
+      })
+      return
+    } catch (err) {
+      const error = err as Error
+      if (attempt >= maxAttempts) {
+        logger.error(
+          `${label} failed after ${attempt} attempts: ${error.message}, skipping this segment`
+        )
+        return
+      }
+      logger.warn(
+        `${label} interrupted (attempt ${attempt}/${maxAttempts}): ${error.message}, retrying...`
+      )
+      await asyncSleep(1000)
+    }
+  }
 }
 
 /**
@@ -113,6 +165,7 @@ async function generateWithLLMStream(task: Task) {
     buildSegmentList(formatLlmSegments(llmSegments), task)
   } else {
     const output = resolve(AUDIO_DIR, id)
+    Object.entries(streamingHeaders(task, id)).forEach(([key, value]) => res.setHeader(key, value))
     let count = 0
     logger.info('Splitting text into multiple segments:', segments.length)
     const getProgress = () => {
@@ -135,15 +188,16 @@ async function generateWithLLMStream(task: Task) {
         )
       }
       for (let segment of formatLlmSegments(llmSegments)) {
-        const stream = (await generateSingleVoiceStream({
-          ...segment,
-          output,
-          outputType: 'stream',
-        })) as Readable
-        stream.pipe(outputStream, { end: false })
-        await new Promise((resolve) => {
-          stream.on('end', resolve)
-        })
+        await pipeSegmentWithRetry(
+          () =>
+            generateSingleVoiceStream({
+              ...segment,
+              output,
+              outputType: 'stream',
+            }) as Promise<Readable>,
+          outputStream,
+          `Segment "${(segment.text || '').slice(0, 10)}..."`
+        )
       }
       logger.info(`Progress: ${getProgress()}%`)
     }
@@ -167,7 +221,7 @@ const buildFinal = async (finalSegments: TTSResult[], id: string) => {
   await ensureDir(finalDir)
   const finalJson = path.resolve(finalDir, '[merged]all_splits.mp3.json')
   await fs.writeFile(finalJson, JSON.stringify(mergedJson, null, 2))
-  await generateSrt(finalJson, path.resolve(AUDIO_DIR, id.replace('.mp3', '.srt')))
+  await generateSrt(finalJson, srtPathFor(path.resolve(AUDIO_DIR, id)))
   const fileList = finalSegments.map((segment) =>
     path.resolve(AUDIO_DIR, path.parse(segment.audio).base)
   )
@@ -206,11 +260,7 @@ async function buildSegment(params: TTSParams, task: Task, dir: string = '') {
   const { res } = task.context as Required<NonNullable<Task['context']>>
 
   streamToResponse(res, stream, {
-    headers: {
-      'content-type': 'application/octet-stream',
-      'x-generate-tts-type': 'stream',
-      'Access-Control-Expose-Headers-generate-tts-id': task.id,
-    },
+    headers: streamingHeaders(task, segment.id),
     fileName: segment.id,
     onError: (err) => `Custom error: ${err.message}`,
     onEnd: () => {
@@ -234,7 +284,7 @@ interface SegmentError extends Error {
 export async function handleSrt(audioPath: string, stream = true) {
   if (!stream) {
     const tempJsonPath = audioPath + '.json'
-    await generateSrt(tempJsonPath, audioPath.replace('.mp3', '.srt'))
+    await generateSrt(tempJsonPath, srtPathFor(audioPath))
     return
   }
   const { dir, base } = path.parse(audioPath)
@@ -263,11 +313,7 @@ async function buildSegmentList(segments: BuildSegment[], task: Task): Promise<v
   const outputStream = new PassThrough()
 
   streamToResponse(res, outputStream, {
-    headers: {
-      'content-type': 'application/octet-stream',
-      'x-generate-tts-type': 'stream',
-      'Access-Control-Expose-Headers-generate-tts-id': task.id,
-    },
+    headers: streamingHeaders(task, segment.id),
     onError: (err) => `Custom error: ${err.message}`,
     fileName: segment.id,
     onEnd: () => {
@@ -283,7 +329,7 @@ async function buildSegmentList(segments: BuildSegment[], task: Task): Promise<v
     },
   })
 
-  const processSegment = async (index: number, maxRetries = 3): Promise<void> => {
+  const processSegment = async (index: number): Promise<void> => {
     if (index >= totalSegments) {
       outputStream.end()
       task?.endTask?.(task.id)
@@ -291,31 +337,19 @@ async function buildSegmentList(segments: BuildSegment[], task: Task): Promise<v
     }
 
     const segment = segments[index]
-    const generateWithRetry = async (attempt = 0): Promise<Readable> => {
-      try {
-        return (await generateSingleVoiceStream({
-          ...segment,
-          outputType: 'stream',
-          output,
-        })) as Readable
-      } catch (err) {
-        const error = err as Error
-        if (attempt + 1 >= maxRetries) {
-          throw Object.assign(error, { segmentIndex: index, attempt: attempt + 1 } as SegmentError)
-        }
-        logger.warn(
-          `Segment ${index + 1} failed (attempt ${attempt + 1}/${maxRetries}): ${error.message}`
-        )
-        await asyncSleep(1000)
-        return generateWithRetry(attempt + 1)
-      }
-    }
 
     try {
       // TODO: Concurrency of streaming flow
-      const audioStream = await generateWithRetry()
-      await audioStream.pipe(outputStream, { end: false })
-      await new Promise((resolve) => audioStream.on('end', resolve))
+      await pipeSegmentWithRetry(
+        () =>
+          generateSingleVoiceStream({
+            ...segment,
+            outputType: 'stream',
+            output,
+          }) as Promise<Readable>,
+        outputStream,
+        `Segment ${index + 1}/${totalSegments}`
+      )
       completedSegments++
       logger.info(`processing text:\n ${segment.text.slice(0, 10)}...`)
       logger.info(`Segment ${index + 1}/${totalSegments} completed. Progress: ${progress()}%`)
@@ -457,7 +491,7 @@ export async function concatDirSrt({
   const mergedJson = mergeSubtitleFiles(subtitleFiles)
   const tempJsonPath = path.resolve(inputDir, 'all_splits.mp3.json')
   await fs.writeFile(tempJsonPath, JSON.stringify(mergedJson, null, 2))
-  await generateSrt(tempJsonPath, outputFile.replace('.mp3', '.srt'))
+  await generateSrt(tempJsonPath, srtPathFor(outputFile))
 }
 
 /**

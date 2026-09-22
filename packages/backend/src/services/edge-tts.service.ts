@@ -1,7 +1,9 @@
 import fs from 'fs/promises'
+import path from 'path'
 import { EdgeSchema } from '../schema/generate'
 import { EdgeTTS } from '../lib/node-edge-tts/edge-tts-fixed'
 import { fileExist, readJson, safeRunWithRetry } from '../utils'
+import { srtPathFor } from '../config'
 
 export async function runEdgeTTS({
   text,
@@ -28,12 +30,19 @@ export async function runEdgeTTS({
     await tts.ttsPromise(text, { audioPath: output, outputType })
     return {
       audio: output,
-      srt: output.replace('.mp3', '.srt'),
+      srt: srtPathFor(output),
       file: '',
     }
   }
   return tts.ttsPromise(text, { audioPath: output, outputType: outputType as any })
 }
+/**
+ * 分段合成失败后的重试间隔基数。
+ * Edge 接口的 1006 断连多半是短时限流，间隔太短（默认 200ms）重试几乎必然再失败，
+ * 这里调大到 1s 起，5 次尝试合计等待约 10s，实测能明显提高成功率
+ */
+const EDGE_RETRY_BASE_DELAY_MS = Number(process.env.EDGE_RETRY_BASE_DELAY_MS || 1000)
+
 export const generateSingleVoice = async (
   params: Omit<EdgeSchema, 'useLLM'> & { output: string }
 ) => {
@@ -45,7 +54,7 @@ export const generateSingleVoice = async (
     async () => {
       result = (await runEdgeTTS({ ...params })) as TTSResult
     },
-    { retries: 5 }
+    { retries: 5, baseDelayMs: EDGE_RETRY_BASE_DELAY_MS }
   )
   return result!
 }
@@ -114,6 +123,8 @@ export const generateSrt = async (jsonPath: string, srtPath: string, deleteJson 
   }
   try {
     const srtTxt = await jsonToSrt(jsonPath)
+    // 字幕目录(项目根 Str)可能还不存在，写入前先确保父目录已创建
+    await fs.mkdir(path.dirname(srtPath), { recursive: true })
     await fs.writeFile(srtPath, srtTxt, 'utf8')
     console.log(`SRT file created at ${srtPath}`)
     if (deleteJson) await fs.unlink(jsonPath)

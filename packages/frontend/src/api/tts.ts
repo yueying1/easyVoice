@@ -112,7 +112,19 @@ export const createTaskStream = async (data: TaskRequest) => {
     const responseData = JSON.parse(text)
     return responseData
   }
-  return response.data as ReadableStream
+  const stream = response.data as ReadableStream
+  // 后端会在流式响应头里带回本次字幕文件名（URL 编码，字幕独立存放在 Str 目录），挂到流上供页面下载使用
+  const rawSrtName = response.headers['x-generate-tts-srt']
+  if (typeof rawSrtName === 'string' && rawSrtName) {
+    try {
+      ;(stream as any).srtName = decodeURIComponent(rawSrtName)
+    } catch (err) {
+      ;(stream as any).srtName = rawSrtName
+    }
+  }
+  return stream
 }
 
-export const downloadFile = (file: string) => `${api.defaults.baseURL}/download/${file}`
+// 用 encodeURI 而不是 encodeURIComponent：产物可能位于 `书名/xxx.mp3` 这样的子目录，
+// 需要保留路径分隔符，只编码中文等字符
+export const downloadFile = (file: string) => `${api.defaults.baseURL}/download/${encodeURI(file)}`
